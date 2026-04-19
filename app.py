@@ -1,5 +1,5 @@
 import streamlit as st
-from groq import Groq
+from openai import OpenAI
 from properties import PROPERTIES, format_properties_for_prompt
 import os, re
 from dotenv import load_dotenv
@@ -113,7 +113,7 @@ with st.sidebar:
     st.divider()
 
     # API key loaded silently from Streamlit secrets / .env — never shown in UI
-    api_key = os.getenv("GROQ_API_KEY", "")
+    api_key = os.getenv("CEREBRAS_API_KEY", "")
 
     st.divider()
     st.markdown("**Cities available**")
@@ -167,41 +167,71 @@ if prompt := st.chat_input("e.g. Show 3BHK in Gurgaon sorted by price low to hig
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     try:
-        client = Groq(api_key=api_key)
+        client = OpenAI(api_key=api_key, base_url="https://api.cerebras.ai/v1")
 
         if is_search_query(prompt):
             # ── Search path: Python sorts, Streamlit renders ──
-            intent = detect_intent(prompt)
-            props  = get_filtered_props(**intent)
+            intent  = detect_intent(prompt)
+            city    = intent.get("city")
+            AVAILABLE_CITIES = ["Gurgaon", "Mumbai", "Hyderabad", "Kolkata"]
+
+            # If user asked for a city we don't have — stop immediately
+            msg_lower = prompt.lower()
+            asked_unknown_city = any(
+                w in msg_lower for w in ["in ", "at ", "near "]
+            ) and city is None and any(
+                c not in msg_lower for c in [c.lower() for c in AVAILABLE_CITIES]
+            )
+
+            # Simpler check: detect if a non-available city was mentioned
+            known = [c.lower() for c in AVAILABLE_CITIES]
+            location_words = [w for w in msg_lower.split() if len(w) > 3
+                              and w not in ["show","find","list","some","with",
+                                            "price","sort","properties","flats",
+                                            "under","above","available","bhk",
+                                            "suggest","give","what","best","good"]]
+            unknown_city_asked = any(w not in known and w not in
+                                     ["".join(c.lower().split()) for c in AVAILABLE_CITIES]
+                                     for w in location_words) and city is None and len(location_words) > 0
 
             with st.chat_message("assistant"):
-                if not props:
-                    reply = "Sorry, I couldn't find any properties matching your criteria. Try adjusting your filters!"
+                if city is None and unknown_city_asked:
+                    reply = (f"Sorry, we currently only have properties in "                             f"**Gurgaon, Mumbai, Hyderabad and Kolkata**. "                             f"We don't have any listings for that location yet!")
                     st.write(reply)
                     st.session_state.messages.append({"role": "assistant", "content": reply, "cards": []})
                 else:
-                    # LLM writes just a 1-line intro, Python renders the cards
-                    intro_response = client.chat.completions.create(
-                        model="llama-3.1-8b-instant",
-                        messages=[
-                            {"role": "system", "content": "You are a real estate assistant. Write exactly ONE short friendly sentence introducing the property results. Do not list any properties."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0.5,
-                        max_tokens=60,
-                    )
-                    intro = intro_response.choices[0].message.content.strip()
-                    st.write(intro)
-                    render_property_cards(props)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": intro,
-                        "cards": props,
-                    })
+                    props = get_filtered_props(**intent)
+                    if not props:
+                        reply = (f"Sorry, no properties found matching your criteria. "                                 f"We have listings in Gurgaon, Mumbai, Hyderabad and Kolkata.")
+                        st.write(reply)
+                        st.session_state.messages.append({"role": "assistant", "content": reply, "cards": []})
+                    else:
+                        # Give LLM the actual city/filter context for an accurate intro
+                        filter_desc = f"city={city or 'all cities'}, sort={intent.get('sort_by_price') or 'none'}"
+                        intro_response = client.chat.completions.create(
+                            model="llama-3.3-70b",
+                            messages=[
+                                {"role": "system", "content": (
+                                    f"You are a real estate assistant. We have properties ONLY in Gurgaon, Mumbai, Hyderabad and Kolkata. "
+                                    f"Write exactly ONE short sentence introducing {len(props)} results for: {filter_desc}. "
+                                    "Do NOT mention any other city. Do not list properties.")},
+                                {"role": "user", "content": prompt},
+                            ],
+                            temperature=0.3,
+                            max_tokens=60,
+                        )
+                        intro = intro_response.choices[0].message.content.strip()
+                        st.write(intro)
+                        render_property_cards(props)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": intro,
+                            "cards": props,
+                        })
         else:
             # ── General Q&A path: LLM answers normally ────────
             response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama-3.3-70b",
                 messages=[
                     {"role": "system", "content": BASE_SYSTEM_PROMPT},
                     *[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
